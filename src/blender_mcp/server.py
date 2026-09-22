@@ -1997,6 +1997,23 @@ async def export_scene(
 
 
 @mcp.tool()
+async def upload_delivery_file(ctx: Context, filepath: str) -> dict[str, object]:
+    """上传已保存的 .blend、导出的 .fbx 或持久 PNG；每次一个文件，Yuxi 核验后才能交付。"""
+    from .delivery import DeliveryError, upload_delivery_file as upload
+
+    request = ctx.request_context.request
+    if request is None:
+        return {"status": "failed", "error_code": "delivery_requires_http"}
+    try:
+        return await asyncio.to_thread(upload, filepath, request.headers)
+    except DeliveryError as exc:
+        return {"status": "failed", "error_code": str(exc)}
+    except Exception:
+        # 不把请求头、表单签名、HTTP 异常 URL 或本地路径写入轨迹。
+        return {"status": "failed", "error_code": "delivery_failed"}
+
+
+@mcp.tool()
 def record_trajectory_feedback(
     ctx: Context,
     feedback: str,

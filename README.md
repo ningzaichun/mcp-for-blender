@@ -37,6 +37,7 @@ Prompt-assisted 3D modeling, scene creation, and manipulation — driven by AI.
 ## Quickstart
 
 For remote testing over a trusted LAN, see [Streamable HTTP setup (中文)](docs/lan-http.md).
+For `.blend`, FBX and PNG delivery to Yuxi, see [file delivery setup (中文)](docs/delivery.md).
 The default transport remains STDIO.
 
 > **Note:** the PyPI package `blender-mcp` is now **`mcp-for-blender`**. Existing setups
