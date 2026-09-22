@@ -1,6 +1,5 @@
 # blender_mcp_server.py
 from mcp.server.fastmcp import FastMCP, Context, Image
-import argparse
 import socket
 import json
 import asyncio
@@ -29,6 +28,7 @@ from .addon_manager import (
 )
 from .consent_prompt import maybe_prompt_for_consent
 from .safe_mode import safe_mode_enabled, validate_code, SandboxViolation, SAFE_MODE_ENV
+from .cli import configure_http, parse_server_args
 
 # Configure logging
 logging.basicConfig(level=logging.INFO,
@@ -48,12 +48,7 @@ def parse_connection_args(argv):
     startup. Unknown args are logged rather than dropped silently, so a typo
     like --prot does not masquerade as "connected to the default port".
     """
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--host", default=None)
-    parser.add_argument("--port", type=int, default=None)
-    args, unknown = parser.parse_known_args(argv)
-    if unknown:
-        logger.warning(f"Ignoring unrecognized command-line arguments: {unknown}")
+    args = parse_server_args(argv)
     return args.host, args.port
 
 
@@ -2178,12 +2173,22 @@ def main():
     """Run the MCP server, or addon install CLI subcommands."""
     global CLI_HOST, CLI_PORT
 
-    if len(sys.argv) > 1 and sys.argv[1] in {"install-addon", "addon-paths", "-h", "--help"}:
+    if len(sys.argv) > 1 and (
+        sys.argv[1] in {"install-addon", "addon-paths"}
+        or any(arg in {"-h", "--help"} for arg in sys.argv[1:])
+    ):
         code = run_addon_cli(sys.argv[1:])
         if code >= 0:
             raise SystemExit(code)
 
-    CLI_HOST, CLI_PORT = parse_connection_args(sys.argv[1:])
+    args = parse_server_args(sys.argv[1:])
+    CLI_HOST, CLI_PORT = args.host, args.port
+    if args.transport == "streamable-http":
+        configure_http(mcp, args)
+        logger.info("Starting LAN test MCP endpoint at http://%s:%s/mcp (no authentication)",
+                    args.http_host, args.http_port)
+        mcp.run(transport="streamable-http")
+        return
 
     # When run by hand (stdin is a TTY) the server appears to "hang" while it
     # silently waits for an MCP client; log a hint so that state is obvious.

@@ -36,6 +36,9 @@ Prompt-assisted 3D modeling, scene creation, and manipulation — driven by AI.
 
 ## Quickstart
 
+For remote testing over a trusted LAN, see [Streamable HTTP setup (中文)](docs/lan-http.md).
+The default transport remains STDIO.
+
 > **Note:** the PyPI package `blender-mcp` is now **`mcp-for-blender`**. Existing setups
 > keep working — `uvx blender-mcp` still runs the server and **no config change is
 > required**. New installs should use `mcp-for-blender`.

@@ -449,26 +449,13 @@ def format_handshake_log(result: AddonHandshake) -> str:
 def run_cli(argv: list[str] | None = None) -> int:
     """CLI entry for install-addon / addon-status. Returns process exit code."""
     import argparse
+    from .cli import add_server_arguments
 
     parser = argparse.ArgumentParser(
         prog="mcp-for-blender",
         description="MCP for Blender server and addon installer",
     )
-    # Declared here only so they show up in `mcp-for-blender --help`; the server
-    # entry point parses them itself (see server.parse_connection_args), since
-    # this CLI returns -1 and exits before the no-subcommand case reaches them.
-    parser.add_argument(
-        "--host",
-        type=str,
-        default=None,
-        help="Host of the Blender socket server (overrides BLENDER_HOST)",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=None,
-        help="Port of the Blender socket server (overrides BLENDER_PORT)",
-    )
+    add_server_arguments(parser)
     sub = parser.add_subparsers(dest="command")
 
     install_p = sub.add_parser(
