@@ -28,8 +28,7 @@ def read_upload_descriptor(headers):
     """验证部署认证及当前调用的有限上传授权。"""
     token = os.environ.get("YUXI_DELIVERY_TOKEN", "")
     expected_url = os.environ.get("YUXI_DELIVERY_UPLOAD_URL", "")
-    root = os.environ.get("YUXI_DELIVERY_ROOT", "")
-    if not token or not expected_url or not root:
+    if not token or not expected_url:
         raise DeliveryError("delivery_not_configured")
     if not hmac.compare_digest(headers.get(TOKEN_HEADER, ""), token):
         raise DeliveryError("delivery_unauthorized")
@@ -58,7 +57,45 @@ def read_upload_descriptor(headers):
             raise ValueError
     except (ValueError, TypeError, KeyError):
         raise DeliveryError("invalid_upload_descriptor") from None
-    return value, Path(root).resolve(strict=True)
+    return value
+
+
+def read_delivery_project(blender):
+    """用固定只读代码取得当前工程，不保存、切换或修改场景。"""
+    try:
+        result = blender.send_command("execute_code", {"code": (
+            'import bpy, json\n'
+            'print(json.dumps({"blend_filepath": bpy.data.filepath, "is_dirty": bpy.data.is_dirty}))'
+        )})
+        value = json.loads(result["result"])
+        if not isinstance(value["blend_filepath"], str) or type(value["is_dirty"]) is not bool:
+            raise ValueError
+    except Exception:
+        raise DeliveryError("delivery_blender_unavailable") from None
+    if not value["blend_filepath"]:
+        raise DeliveryError("delivery_project_unsaved")
+    path = Path(value["blend_filepath"])
+    try:
+        if not path.is_absolute() or path.suffix.lower() != ".blend" or not path.is_file():
+            raise ValueError
+        path = path.resolve(strict=True)
+    except (OSError, ValueError):
+        raise DeliveryError("delivery_project_unavailable") from None
+    return {"blend_filepath": str(path), "directory": str(path.parent), "is_dirty": value["is_dirty"]}
+
+
+def check_delivery_project(project, expected_blend_filepath):
+    """预期路径只用于检测切换，目录范围始终来自 Blender 实际工程。"""
+    if not isinstance(expected_blend_filepath, str) or not Path(expected_blend_filepath).is_absolute():
+        raise DeliveryError("delivery_project_changed")
+    try:
+        expected = Path(expected_blend_filepath).resolve(strict=True)
+    except (OSError, ValueError):
+        raise DeliveryError("delivery_project_changed") from None
+    if expected != Path(project["blend_filepath"]):
+        raise DeliveryError("delivery_project_changed")
+    if project["is_dirty"]:
+        raise DeliveryError("delivery_project_dirty")
 
 
 @contextmanager
@@ -71,6 +108,9 @@ def open_delivery_source(filepath, root):
         raise DeliveryError("invalid_delivery_path")
     try:
         path.relative_to(root)
+    except ValueError:
+        raise DeliveryError("delivery_outside_project") from None
+    try:
         for parent in (path, *path.parents):
             if parent == root:
                 break
@@ -121,9 +161,12 @@ def open_delivery_source(filepath, root):
         raise DeliveryError("delivery_source_unavailable") from None
 
 
-def upload_delivery_file(filepath, headers):
+def upload_delivery_file(filepath, expected_blend_filepath, headers, read_project):
     """上传稳定副本并返回待 Yuxi 独立核验的版本信息。"""
-    descriptor, root = read_upload_descriptor(headers)
+    descriptor = read_upload_descriptor(headers)
+    project = read_project()
+    check_delivery_project(project, expected_blend_filepath)
+    root = Path(project["directory"])
     with open_delivery_source(filepath, root) as source, tempfile.TemporaryFile() as snapshot:
         before = os.fstat(source.fileno())
         if not 0 < before.st_size <= descriptor["max_bytes"]:
@@ -140,6 +183,7 @@ def upload_delivery_file(filepath, headers):
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or size != before.st_size:
             raise DeliveryError("delivery_source_changed")
         snapshot.seek(0)
+        check_delivery_project(read_project(), project["blend_filepath"])
         try:
             with httpx.Client(timeout=httpx.Timeout(120, connect=10), follow_redirects=False) as client:
                 response = client.post(descriptor["upload_url"], data=descriptor["form_fields"],

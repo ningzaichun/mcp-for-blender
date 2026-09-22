@@ -1997,15 +1997,45 @@ async def export_scene(
 
 
 @mcp.tool()
-async def upload_delivery_file(ctx: Context, filepath: str) -> dict[str, object]:
-    """上传已保存的 .blend、导出的 .fbx 或持久 PNG；每次一个文件，Yuxi 核验后才能交付。"""
-    from .delivery import DeliveryError, upload_delivery_file as upload
+async def get_delivery_context() -> dict[str, object]:
+    """只读查询当前 Blender 工程路径、目录和 is_dirty；不保存或切换工程。
+
+    开始建模及交付前查询并记录 blend_filepath。新工程先保存；已有工程在原位置续编。
+    完成建模交付时默认准备 .blend、明确范围导出的 .fbx 和持久 PNG，存入工程目录或子目录，
+    保存最终修改后逐一调用 upload_delivery_file。仅查询或讨论不触发交付。
+    """
+    from .delivery import DeliveryError, read_delivery_project
+
+    try:
+        return await asyncio.to_thread(lambda: read_delivery_project(get_blender_connection()))
+    except DeliveryError as exc:
+        return {"status": "failed", "error_code": str(exc)}
+    except Exception:
+        return {"status": "failed", "error_code": "delivery_blender_unavailable"}
+
+
+@mcp.tool()
+async def upload_delivery_file(ctx: Context, filepath: str, expected_blend_filepath: str) -> dict[str, object]:
+    """从当前已保存 Blender 工程目录直接交付一个 .blend、.fbx 或 PNG 文件，最大 100 MiB。
+
+    建模或修改完成后默认逐一交付原生 .blend、FBX、持久 PNG；本机路径和临时截图不等于交付。
+    先用 get_delivery_context 记录本次目标工程路径，保存最终修改并验证导出、图片后调用。
+    filepath 为文件绝对路径；expected_blend_filepath 为记录的目标工程路径，不能随切换而猜测。
+    文件须在当前工程目录或子目录；无需复制到固定上传根。不隐式保存、导出或切换工程。
+    delivery_project_unsaved/dirty 表示需要保存；project_changed 表示工程切换，停止并核对目标；
+    delivery_outside_project 表示文件在工程目录之外。上传期间不要编辑或切换工程。
+    Yuxi 返回 status=ready 才能声明可下载；failed/pending 须说明原因，不能以截图替代成功。
+    """
+    from .delivery import DeliveryError, read_delivery_project, upload_delivery_file as upload
 
     request = ctx.request_context.request
     if request is None:
         return {"status": "failed", "error_code": "delivery_requires_http"}
     try:
-        return await asyncio.to_thread(upload, filepath, request.headers)
+        return await asyncio.to_thread(
+            upload, filepath, expected_blend_filepath, request.headers,
+            lambda: read_delivery_project(get_blender_connection()),
+        )
     except DeliveryError as exc:
         return {"status": "failed", "error_code": str(exc)}
     except Exception:

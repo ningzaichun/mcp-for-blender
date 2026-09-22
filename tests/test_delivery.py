@@ -17,7 +17,8 @@ from blender_mcp import delivery, server
 @pytest.fixture
 def upload_setup(tmp_path, monkeypatch):
     """提供临时授权根及明确的测试上传描述。"""
-    monkeypatch.setenv("YUXI_DELIVERY_ROOT", str(tmp_path))
+    monkeypatch.setenv("YUXI_DELIVERY_ROOT", str(tmp_path / "obsolete-root"))
+    (tmp_path / "scene.blend").write_bytes(b"saved blend")
     monkeypatch.setenv("YUXI_DELIVERY_TOKEN", "test-only-token")
     monkeypatch.setenv("YUXI_DELIVERY_UPLOAD_URL", "https://storage.example.com/yuxi-deliveries")
     value = {"protocol_version": 1, "artifact_id": "artifact-1",
@@ -59,7 +60,7 @@ def test_invalid_authority_never_sends_file(upload_setup, monkeypatch, tmp_path,
         pytest.fail("invalid input reached network")
     monkeypatch.setattr(delivery.httpx, "Client", no_network)
     with pytest.raises(delivery.DeliveryError):
-        delivery.upload_delivery_file(str(path), headers(value, token))
+        delivery.upload_delivery_file(str(path), str(tmp_path / "scene.blend"), headers(value, token), project_reader(tmp_path))
 
 
 @pytest.mark.parametrize("status,version", [(307, "v1"), (204, None), (204, "v1")])
@@ -75,9 +76,9 @@ def test_upload_bytes_and_version_response(upload_setup, monkeypatch, status, ve
                         client_type(transport=httpx.MockTransport(receive), **kwargs))
     if status != 204 or version is None:
         with pytest.raises(delivery.DeliveryError):
-            delivery.upload_delivery_file(str(path), headers(value))
+            delivery.upload_delivery_file(str(path), str(path.parent / "scene.blend"), headers(value), project_reader(path.parent))
     else:
-        result = delivery.upload_delivery_file(str(path), headers(value))
+        result = delivery.upload_delivery_file(str(path), str(path.parent / "scene.blend"), headers(value), project_reader(path.parent))
         assert result["status"] == "uploaded"
         assert result["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
         assert result["version_id"] == "v1"
@@ -98,7 +99,7 @@ def test_windows_source_cannot_be_changed_while_snapshotted(upload_setup):
 def test_upload_tool_schema_has_only_file_and_structured_result():
     """SDK 自动注册必须保留结构化返回及隐藏的 Context。"""
     tool = next(item for item in asyncio.run(server.mcp.list_tools()) if item.name == "upload_delivery_file")
-    assert set(tool.inputSchema["properties"]) == {"filepath"}
+    assert set(tool.inputSchema["properties"]) == {"filepath", "expected_blend_filepath"}
     assert tool.outputSchema is not None
 
 
@@ -112,7 +113,7 @@ def test_link_inside_root_cannot_publish_external_file(upload_setup, tmp_path, m
     link.symlink_to(outside, target_is_directory=True)
     monkeypatch.setattr(delivery.httpx, "Client", lambda **kwargs: pytest.fail("link reached network"))
     with pytest.raises(delivery.DeliveryError, match="invalid_delivery_path"):
-        delivery.upload_delivery_file(str(link / "secret.blend"), headers(value))
+        delivery.upload_delivery_file(str(link / "secret.blend"), str(tmp_path / "scene.blend"), headers(value), project_reader(tmp_path))
 
 
 def test_network_failure_never_returns_authorization(upload_setup, monkeypatch):
@@ -124,5 +125,80 @@ def test_network_failure_never_returns_authorization(upload_setup, monkeypatch):
     monkeypatch.setattr(delivery.httpx, "Client", lambda **kwargs:
                         client_type(transport=httpx.MockTransport(disconnected), **kwargs))
     with pytest.raises(delivery.DeliveryError) as failure:
-        delivery.upload_delivery_file(str(path), headers(value))
+        delivery.upload_delivery_file(str(path), str(path.parent / "scene.blend"), headers(value), project_reader(path.parent))
     assert str(failure.value) == "delivery_upload_unconfirmed"
+
+
+def project_reader(root, *, dirty=False):
+    """模拟来自 Blender 固定只读查询的工程事实。"""
+    return lambda: {"blend_filepath": str(root / "scene.blend"), "directory": str(root), "is_dirty": dirty}
+
+
+@pytest.mark.parametrize("case,code", [
+    ("dirty", "delivery_project_dirty"),
+    ("switched", "delivery_project_changed"),
+    ("during_snapshot", "delivery_project_changed"),
+    ("outside", "delivery_outside_project"),
+])
+def test_project_guards_prevent_upload(upload_setup, monkeypatch, tmp_path, case, code):
+    """工程脏状态、同目录切换与越界在发送字节前明确失败。"""
+    value, path = upload_setup
+    expected = tmp_path / "scene.blend"
+    other = tmp_path / "other.blend"
+    other.write_bytes(b"other project")
+    project = project_reader(tmp_path)()
+    reads = iter([project, {**project, "blend_filepath": str(other)}])
+    read = lambda: next(reads)
+    if case == "dirty":
+        read = project_reader(tmp_path, dirty=True)
+    elif case == "switched":
+        expected = other
+    elif case == "outside":
+        path = tmp_path.parent / "outside.fbx"
+    monkeypatch.setattr(delivery.httpx, "Client", lambda **kwargs: pytest.fail("invalid project reached network"))
+    with pytest.raises(delivery.DeliveryError, match=code):
+        delivery.upload_delivery_file(str(path), str(expected), headers(value), read)
+
+
+@pytest.mark.parametrize("case,code", [
+    ("unsaved", "delivery_project_unsaved"),
+    ("missing", "delivery_project_unavailable"),
+    ("malformed", "delivery_blender_unavailable"),
+    ("offline", "delivery_blender_unavailable"),
+])
+def test_live_project_query_failures(tmp_path, case, code):
+    """查询来源不可用时禁止猜测进程目录或退回环境授权根。"""
+    class Blender:
+        def send_command(self, command, params):
+            assert command == "execute_code"
+            assert "bpy.data.filepath" in params["code"]
+            assert "bpy.ops" not in params["code"]
+            if case == "offline":
+                raise ConnectionError("private host detail")
+            if case == "malformed":
+                return {"result": "unexpected output"}
+            return {"result": json.dumps({"blend_filepath": "" if case == "unsaved" else str(tmp_path / "missing.blend"), "is_dirty": False})}
+    with pytest.raises(delivery.DeliveryError, match=code):
+        delivery.read_delivery_project(Blender())
+
+
+def test_tool_uses_live_blender_project_and_hides_authority(upload_setup, monkeypatch, tmp_path):
+    """通过实际注册函数读取 addon 回包，旧固定根不影响当前工程交付。"""
+    from types import SimpleNamespace
+    value, path = upload_setup
+    queries = []
+    class Blender:
+        def send_command(self, command, params):
+            queries.append(command)
+            return {"result": json.dumps({"blend_filepath": str(tmp_path / "scene.blend"), "is_dirty": False})}
+    monkeypatch.setattr(server, "get_blender_connection", lambda: Blender())
+    client_type = httpx.Client
+    monkeypatch.setattr(delivery.httpx, "Client", lambda **kwargs: client_type(
+        transport=httpx.MockTransport(lambda req: httpx.Response(204, headers={"x-amz-version-id": "v1"})), **kwargs))
+    ctx = SimpleNamespace(request_context=SimpleNamespace(request=SimpleNamespace(headers=headers(value))))
+    context = asyncio.run(server.get_delivery_context())
+    result = asyncio.run(server.upload_delivery_file(ctx, str(path), context["blend_filepath"]))
+    assert result["status"] == "uploaded"
+    assert result["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert queries == ["execute_code"] * 3
+    assert "test-only-policy" not in json.dumps(result)
